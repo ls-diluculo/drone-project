@@ -12,6 +12,6 @@
 
 ↓
 
-git push
+最后 git push
 
 
