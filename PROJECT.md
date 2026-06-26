@@ -41,16 +41,43 @@
 
 ### 3.2 摘要数据库构建流程
 
-1. 遍历历史回放数据中的局部人物轨迹。
-2. 对每个新出现的局部人物 ID，选取一张代表人物图像。
-3. 对代表人物图像计算 embedding。
-4. 将代表人物图像、embedding、局部 ID、来源无人机、首次出现时间等信息写入摘要数据库。
-5. 通过 REID 判断该局部人物是否对应已有全局人物 ID：
-   - 若命中已有全局人物，则关联到已有全局人物 ID；
-   - 若未命中，则在摘要数据库中新增一个全局人物 ID。
-6. 完整数据库中的该局部人物后续观测记录应关联到对应的全局人物 ID。
+系统采用 **Redis Cluster + 协调节点** 双层存储架构实现摘要数据库与完整数据库的构建。
 
-摘要数据库因此承担人物库功能：只要某个人在历史数据中入镜过，理论上就应该至少有一张代表图像及其 embedding 存在于摘要数据库中。
+**Cluster 层（每台 UAV 一个节点）：**
+
+- 帧数据以 Redis Hash 存储，Key 格式为 `{source_uav}:data:{14位时间戳}_{6位微秒}:{local_person_id}`；
+- 为每个 local_person_id 维护一个 Set 索引，Key 格式为 `{source_uav}:idx:local:{local_person_id}`，成员为该 local_id 下所有帧数据的 Key；
+- 对 `person_vector` 字段建立 HNSW 向量索引（索引名 `{source_uav}vector_idx`，FLOAT32、2048 维、COSINE 距离度量），支撑以图搜人的 KNN 检索。
+
+> `{}` 包裹部分用于 Redis Cluster 的 hash slot 计算，确保同一 UAV 的帧数据和索引落在同一节点，避免 CrossSlot 错误。
+
+**协调节点（主 UAV 上的 Standalone Redis）：**
+
+- 存储 BEV 轨迹摘要数据（Hash），Key 格式为 `{source_uav}:bev:{local_person_id}`；
+- 维护 global_id 索引 Set，Key 格式为 `global_idx:{global_person_id}`，成员为 `{source_uav}:{local_person_id}` 对，作为跨无人机轨迹查询的"目录"。
+
+**构建流程：**
+
+1. 遍历历史回放数据中的局部人物轨迹，逐帧解析检测结果。
+2. 对每个新出现的局部人物 ID，选取一张代表人物图像。
+3. 对代表人物图像计算 2048 维 float32 embedding（对应 Hash 中的 `person_vector` 字段）。
+4. 将每帧观测数据写入对应 UAV 的 Redis Cluster 节点：
+   - 以 `{source_uav}:data:{14位时间戳}_{6位微秒}:{local_person_id}` 为 Key 创建 Hash；
+   - 写入 `local_person_id`、`source_uav`、`image_path`、`depth_image`、`timestamp`、`location`、`box_pos`、`person_vector`、`source_image` 等字段；
+   - 初始阶段 `global_person_id` 设为 -1（未关联全局身份）；
+   - 将帧 Key 加入 local_id 索引 Set：`SADD {source_uav}:idx:local:{local_person_id} <帧Key>`；
+   - 将 `person_vector` 纳入该 UAV 节点的 HNSW 向量索引。
+5. 通过 REID 判断该局部人物是否对应已有全局人物 ID：
+   - 利用各节点 HNSW 向量索引并发执行 KNN 检索，聚合 Top-K 候选；
+   - 若命中已有全局人物，则关联到已有 `global_person_id`；
+   - 若未命中，则分配一个新的全局人物 ID。
+6. ReID 完成后，回填全局身份信息：
+   - 逐帧更新 Cluster 节点中该 local_id 所有帧 Hash 的 `global_person_id` 字段（从 -1 改为实际值）；
+   - 向协调节点的 BEV 轨迹 Hash（`{source_uav}:bev:{local_person_id}`）写入 `local_person_id`、`global_person_id`、`person_vector`、`track`（轨迹点序列 JSON）；
+   - 向协调节点的 global_id 索引 Set 添加成员：`SADD global_idx:{global_person_id} "{source_uav}:{local_person_id}"`。
+7. 当该人物离开视野后，可将精选轨迹数据汇总到协调节点的 BEV Hash 中，供后续快速查询。
+
+摘要数据库因此承担人物库功能：Cluster 各节点的 HNSW 向量索引支撑以图搜人，协调节点的 `global_idx` 索引提供跨 UAV 的全局身份目录。只要某个人在历史数据中入镜过，其代表图像 embedding 就存在于对应 UAV 节点的向量索引中，且 `global_idx` 中留有跨无人机归并记录。
 
 ### 3.3 查询人物流程
 
@@ -164,57 +191,115 @@
 
 ### 5.3 数据存储模块
 
-系统逻辑上维护两类数据库：摘要数据库和完整数据库。
+系统采用 **Redis Cluster + 协调节点** 架构，逻辑上承担摘要数据库与完整数据库两类职责：
 
-#### 摘要数据库 / 人物库
+- **Cluster 节点**（每台 UAV 一个）同时承担摘要检索（HNSW 向量索引）和完整观测（逐帧 Hash）存储；
+- **协调节点**（主 UAV 上的 Standalone Redis）负责跨无人机全局索引和 BEV 轨迹汇总。
 
-用于快速 REID 和查询，保存所有入镜过人物的轻量摘要信息。当前设计中，摘要数据库就是人物库，不再单独抽象另一套人物库。
+两层数据库不再做独立的表结构设计，而是以 Redis 原生数据结构实现。
 
-建议字段：
+#### 5.3.1 Cluster 节点存储（每台 UAV 一个）
 
-- `global_person_id`：全局人物 ID；
-- `source_drone_id`：来源无人机 ID；
-- `local_track_id`：局部人物 ID；
-- `representative_image_path`：代表人物图像路径；
-- `representative_embedding`：代表图像 embedding；
-- `first_seen_time`：首次出现时间；
-- `last_seen_time`：最近出现时间；
-- `match_status`：新增、已匹配等状态；
-- `similarity`：与已有全局人物匹配时的相似度；
-- `summary_observation_id`：该代表图像对应的完整观测记录 ID。
+##### 帧数据 — Redis Hash
 
-摘要数据库的核心作用：
+**用途：** 存储每帧检测到的单个目标的全部信息，是完整数据库的核心。
 
-- 保存所有历史入镜人物的代表图像和 embedding；
-- 维护局部人物 ID 到全局人物 ID 的归并关系；
-- 支撑查询图像的 REID 检索；
-- 为完整数据库检索提供全局人物 ID。
+**Key 格式：** `{source_uav}:data:{14位时间戳}_{6位微秒}:{local_person_id}`
 
-#### 完整数据库
+**Hash 字段：**
 
-用于保存完整观测记录，支撑轨迹生成和历史回放。
+| Field              | 类型   | 说明                                              |
+|--------------------|--------|---------------------------------------------------|
+| `local_person_id`  | int    | 本机跟踪器临时 ID                                  |
+| `global_person_id` | int    | 跨无人机统一 ID，ReID 前为 -1                       |
+| `source_image`     | str    | 原始帧图片路径                                     |
+| `source_uav`       | str    | 来源无人机标识（含 hash tag）                       |
+| `image_path`       | str    | 目标裁剪图路径                                     |
+| `depth_image`      | str    | 深度相机图片路径（可选）                            |
+| `timestamp`        | float  | 帧时间戳（Unix 秒）                                |
+| `location`         | JSON   | 目标世界坐标 `[x, y]` 或 `[x, y, z]`               |
+| `box_pos`          | JSON   | 检测框 `[x1, y1, x2, y2]`                         |
+| `person_vector`    | bytes  | 2048 维 ReID 特征向量（float32，8192 字节）         |
 
-建议字段：
+##### local_id 索引 — Redis Set
 
-- `observation_id`：观测记录 ID；
-- `global_person_id`：全局人物 ID；
-- `source_drone_id`：来源无人机 ID；
-- `local_track_id`：局部人物 ID；
-- `timestamp`：观测时间；
-- `rgb_image_path`：原始 RGB 图像路径；
-- `depth_image_path`：深度图像路径；
-- `person_crop_path`：人物裁剪图路径；
-- `bbox`：人物在原始图像中的像素框；
-- `camera_intrinsics`：相机内参；
-- `camera_extrinsics`：相机外参；
-- `drone_pose`：无人机位姿；
-- `estimated_position`：轨迹模块计算出的空间坐标，可后处理写回。
+**用途：** 快速查出某个 `local_person_id` 产生的所有帧的 Key。
 
-完整数据库的核心作用：
+**Key 格式：** `{source_uav}:idx:local:{local_person_id}`
 
-- 保存人物每一次被观测到时的完整信息；
-- 支撑按全局人物 ID 查询历史观测；
-- 为轨迹生成模块提供深度图、像素框、时间戳和位姿信息。
+**Value：** Set 类型，成员为该 local_id 对应的所有帧 Hash Key。
+
+##### 向量索引 — RediSearch HNSW
+
+**用途：** 对 `person_vector` 字段建 HNSW 索引，支持以图搜人的 KNN 向量检索，承担摘要数据库的检索功能。
+
+**索引名：** `{source_uav}vector_idx`
+
+**索引配置：**
+- 类型：HNSW
+- 向量算法：FLOAT32，2048 维
+- 距离度量：COSINE
+- 前缀匹配：`{source_uav}:`（只索引该 UAV 的 Key）
+
+#### 5.3.2 协调节点存储（主 UAV 上的 Standalone Redis）
+
+##### BEV 轨迹数据 — Redis Hash
+
+**用途：** 目标离开视野后，汇总的精选轨迹数据（非逐帧），支撑快速轨迹概览。
+
+**Key 格式：** `{source_uav}:bev:{local_person_id}`
+
+**Hash 字段：**
+
+| Field              | 类型   | 说明                            |
+|--------------------|--------|---------------------------------|
+| `local_person_id`  | int    | 本机跟踪器临时 ID                |
+| `global_person_id` | int    | 跨无人机统一 ID                  |
+| `person_vector`    | bytes  | 2048 维特征向量（float32）       |
+| `track`            | JSON   | 轨迹点序列 JSON 字符串            |
+
+##### global_id 索引 — Redis Set
+
+**用途：** 记录某个全局 ID 对应哪些 UAV 的哪些 local_id，是跨无人机轨迹查询的"目录"。
+
+**Key 格式：** `global_idx:{global_person_id}`
+
+**Value：** Set 类型，成员为 `{source_uav}:{local_person_id}` 对。
+
+#### 5.3.3 查找路径总结
+
+```
+场景1: 查某 UAV 某 local_id 的所有帧
+  {source_uav}:idx:local:{local_id}
+    → SMEMBERS 拿到所有 Key
+    → 逐个 HGETALL 获取每帧完整数据
+
+场景2: 查某个 global_id 的跨无人机完整轨迹
+  global_idx:{global_id}
+    → SMEMBERS 拿到 (uav, local_id) 对
+    → 逐个查 {uav}:idx:local:{local_id}
+      → SMEMBERS 拿帧 Key
+      → HGETALL 逐帧获取数据
+    → 合并排序，返回完整轨迹
+
+场景3: 以图搜人 (KNN)
+  计算查询图 embedding (2048维 float32)
+    → 并发查各 UAV 节点的 HNSW 索引
+    → 聚合 Top-K 候选
+    → 超过阈值的最高相似度候选作为匹配结果
+```
+
+#### 5.3.4 与原有抽象字段的对应关系
+
+
+| 逻辑概念                     | Redis 实现                                                                 |
+|------------------------------|----------------------------------------------------------------------------|
+| 摘要数据库 / 人物库           | Cluster 各节点的 HNSW 向量索引（以图搜人）+ 协调节点 `global_idx`（跨 UAV 目录） |
+| 完整数据库                   | Cluster 各节点的帧数据 Hash（逐帧全量观测信息）                               |
+| 代表人物图像 / embedding      | 每帧 Hash 中的 `image_path` + `person_vector` 字段（2048 维 float32）        |
+| 局部人物 ID 到全局人物 ID 归并 | `global_person_id` 字段（初始 -1，ReID 后回填）+ `global_idx` 索引            |
+| 轨迹数据                     | Cluster 逐帧 `location` 字段 + 协调节点 BEV Hash 中的 `track` JSON            |
+| 观测记录 ID                  | 帧 Hash Key：`{source_uav}:data:{时间戳}:{local_person_id}`                  |
 
 ### 5.4 轨迹生成模块
 
